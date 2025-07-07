@@ -4,9 +4,22 @@ services:
     working_dir: /app
     volumes:
     - .:/app
+    - pip-cache:/root/.cache/pip
     command: python main.py
     environment:
     - PYTHONUNBUFFERED=1
+    develop:
+      watch:
+        - path: requirements.txt
+          action: rebuild
+        - path: .
+          target: /app
+          action: sync
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -20,11 +33,26 @@ services:
     working_dir: /app
     volumes:
     - .:/app
+    - pip-cache:/root/.cache/pip
     command: python manage.py runserver 0.0.0.0:8000
     ports:
     - 8000:8000
     environment:
     - PYTHONUNBUFFERED=1
     - DJANGO_SETTINGS_MODULE=project.settings
+    platform: linux/amd64
+    develop:
+      watch:
+        - path: requirements.txt
+          action: rebuild
+        - path: .
+          target: /app
+          action: sync
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1.5G
 volumes:
   pgdata: null
+  pip-cache: null

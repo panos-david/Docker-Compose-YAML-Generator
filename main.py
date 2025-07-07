@@ -77,6 +77,18 @@ TEMPLATES: Dict[str, str] = {
             command: npm start
             environment:
               - NODE_ENV=development
+            develop:
+              watch:
+                - path: package.json
+                  action: rebuild
+                - path: .
+                  target: /app
+                  action: sync
+            deploy:
+              resources:
+                limits:
+                  cpus: '1'
+                  memory: 1G
         """
     ),
     "spring": textwrap.dedent(
@@ -87,9 +99,24 @@ TEMPLATES: Dict[str, str] = {
             working_dir: /app
             volumes:
               - .:/app
+              - maven-cache:/root/.m2
             command: ["java","-jar","app.jar"]
             environment:
               SPRING_PROFILES_ACTIVE: dev
+            develop:
+              watch:
+                - path: target/*.jar
+                  action: rebuild
+                - path: src
+                  target: /app/src
+                  action: sync
+            deploy:
+              resources:
+                limits:
+                  cpus: '2'
+                  memory: 2G
+        volumes:
+          maven-cache:
         """
     ),
     "php": textwrap.dedent(
@@ -175,9 +202,24 @@ TEMPLATES: Dict[str, str] = {
             working_dir: /app
             volumes:
               - .:/app
+              - pip-cache:/root/.cache/pip
             command: python main.py
             environment:
               - PYTHONUNBUFFERED=1
+            develop:
+              watch:
+                - path: requirements.txt
+                  action: rebuild
+                - path: .
+                  target: /app
+                  action: sync
+            deploy:
+              resources:
+                limits:
+                  cpus: '1'
+                  memory: 1G
+        volumes:
+          pip-cache:
         """
     ),
     "mysql": textwrap.dedent(
@@ -660,7 +702,8 @@ def merge_services(compose_objects: List[dict]) -> dict:
     return merged
 
 
-def generate_compose(project_root: Path, extra: List[str] | None = None) -> dict:
+def generate_compose(project_root: Path, extra: List[str] | None = None, generate_bake: bool = True, 
+                    enable_gpu: bool = True, add_watch_mode: bool = True) -> dict:
     techs = find_project_types(project_root)
     if extra:
         techs.extend(extra)
@@ -697,8 +740,30 @@ def generate_compose(project_root: Path, extra: List[str] | None = None) -> dict
                                 service_config["image"] = f"{base_image}:{version}"
             
             parts.append(template_dict)
+
+    # Merge all the service templates
+    merged_compose = merge_services(parts)
     
-    return merge_services(parts)
+    # Add BuildKit cache optimization if there are builds
+    merged_compose = add_buildkit_cache_hints(merged_compose)
+    
+    # Add platform-specific configurations
+    platform_info = detect_platform()
+    merged_compose = apply_platform_configuration(merged_compose, platform_info)
+    
+    # Add GPU configuration if enabled and available
+    if enable_gpu:
+        gpu_capabilities = detect_gpu_capabilities()
+        merged_compose = apply_gpu_configuration(merged_compose, gpu_capabilities)
+    
+    # Generate docker-bake.hcl file if requested
+    if generate_bake:
+        try:
+            generate_bake_file(project_root, merged_compose)
+        except Exception as e:
+            print(f"Warning: Could not generate bake file: {e}", file=sys.stderr)
+    
+    return merged_compose
 
 
 def write_compose(compose: dict, output_path: Path) -> None:
@@ -931,6 +996,225 @@ def tk_file_dialog() -> Path | None:
     return Path(directory) if directory else None
 
 
+# --- GPU Detection and Platform Configuration -------------------------------------------
+
+def detect_gpu_capabilities() -> Dict[str, bool]:
+    """Detect GPU capabilities like CUDA, ROCm, or OpenCL availability."""
+    gpu_capabilities = {
+        "cuda": False,
+        "rocm": False,
+        "opencl": False,
+        "intel_gpu": False,
+        "has_gpu": False
+    }
+    
+    # Check NVIDIA GPUs (CUDA)
+    try:
+        import subprocess
+        result = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode == 0:
+            gpu_capabilities["cuda"] = True
+            gpu_capabilities["has_gpu"] = True
+    except:
+        pass
+    
+    # Check AMD GPUs (ROCm)
+    try:
+        result = subprocess.run(["rocm-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode == 0:
+            gpu_capabilities["rocm"] = True
+            gpu_capabilities["has_gpu"] = True
+    except:
+        pass
+    
+    # Check OpenCL support
+    try:
+        import ctypes
+        ctypes.CDLL("libOpenCL.so")
+        gpu_capabilities["opencl"] = True
+    except:
+        try:
+            ctypes.CDLL("OpenCL.dll")
+            gpu_capabilities["opencl"] = True
+        except:
+            pass
+    
+    # Check Intel GPUs
+    try:
+        result = subprocess.run(["intel_gpu_top", "-L"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode == 0:
+            gpu_capabilities["intel_gpu"] = True
+            gpu_capabilities["has_gpu"] = True
+    except:
+        pass
+    
+    return gpu_capabilities
+
+def detect_platform() -> Dict[str, str]:
+    """Detect platform-specific information."""
+    import platform
+    
+    arch = platform.machine().lower()
+    os_name = platform.system().lower()
+    
+    platform_info = {
+        "architecture": arch,
+        "os": os_name,
+        "is_arm": "arm" in arch or "aarch" in arch,
+        "is_x86": "x86" in arch or "amd64" in arch,
+        "docker_platform": "linux/amd64" if "x86" in arch or "amd64" in arch else "linux/arm64"
+    }
+    
+    return platform_info
+
+def apply_gpu_configuration(compose_dict: dict, gpu_capabilities: Dict[str, bool]) -> dict:
+    """Apply GPU-specific configuration to docker-compose services."""
+    if not gpu_capabilities.get("has_gpu", False):
+        return compose_dict
+    
+    if "services" not in compose_dict:
+        return compose_dict
+    
+    for service_name, service_config in compose_dict["services"].items():
+        # Skip services that shouldn't get GPU access (like databases)
+        if service_name in ["db", "redis", "postgres", "mysql", "mariadb", "mongodb"]:
+            continue
+        
+        # Set deploy section with GPU resources
+        deploy = service_config.setdefault("deploy", {})
+        resources = deploy.setdefault("resources", {})
+        
+        if gpu_capabilities.get("cuda", False):
+            # NVIDIA GPU configuration
+            if "reservations" not in resources:
+                resources["reservations"] = {}
+            
+            devices = resources["reservations"].setdefault("devices", [])
+            devices.append({
+                "driver": "nvidia",
+                "count": "all",
+                "capabilities": ["gpu", "compute", "utility"]
+            })
+            
+            # Add NVIDIA runtime if needed for older Docker versions
+            service_config["runtime"] = "nvidia"
+        
+        elif gpu_capabilities.get("rocm", False):
+            # AMD GPU configuration
+            if "reservations" not in resources:
+                resources["reservations"] = {}
+                
+            devices = resources["reservations"].setdefault("devices", [])
+            devices.append({
+                "driver": "amd",
+                "count": "all",
+                "capabilities": ["gpu", "compute"]
+            })
+    
+    return compose_dict
+
+def apply_platform_configuration(compose_dict: dict, platform_info: Dict[str, str]) -> dict:
+    """Apply platform-specific configuration to docker-compose services."""
+    if "services" not in compose_dict:
+        return compose_dict
+    
+    for service_name, service_config in compose_dict["services"].items():
+        if "image" in service_config:
+            # Add platform flag for cross-platform compatibility
+            service_config["platform"] = platform_info["docker_platform"]
+    
+    return compose_dict
+
+
+# --- BuildKit Caching and Bake Support ----------------------------------------------
+
+def add_buildkit_cache_hints(compose_dict: dict) -> dict:
+    """Add BuildKit cache optimization hints to service builds."""
+    if "services" not in compose_dict:
+        return compose_dict
+    
+    for service_name, service_config in compose_dict["services"].items():
+        if "build" in service_config:
+            # If build is a string, convert to dict
+            if isinstance(service_config["build"], str):
+                service_config["build"] = {"context": service_config["build"]}
+                
+            # Add BuildKit cache settings
+            build_config = service_config["build"]
+            
+            # Add cache_from and cache_to directives
+            build_config["cache_from"] = ["type=registry,ref=user/app:buildcache"]
+            build_config["cache_to"] = ["type=inline,mode=max"]
+            
+            # Add build arguments for better caching
+            if "args" not in build_config:
+                build_config["args"] = {}
+            
+            build_config["args"]["BUILDKIT_INLINE_CACHE"] = "1"
+    
+    return compose_dict
+
+def generate_bake_file(project_root: Path, compose_dict: dict) -> None:
+    """Generate a docker-bake.hcl file for the project."""
+    bake_content = """// docker-bake.hcl - Generated by Docker Compose YAML Generator
+// Run with: docker buildx bake
+
+group "default" {
+  targets = ["development"]
+}
+
+group "production" {
+  targets = ["app-production"]
+}
+
+group "development" {
+  targets = ["app-development"]
+}
+
+// Default variables
+variable "TAG" {
+  default = "latest"
+}
+
+"""
+    
+    # Add targets for each buildable service
+    if "services" in compose_dict:
+        for service_name, service_config in compose_dict["services"].items():
+            if "build" in service_config:
+                # Get build context
+                build_context = service_config["build"]
+                if isinstance(build_context, dict):
+                    build_context = build_context.get("context", ".")
+                
+                # Add development target
+                bake_content += f"""
+target "{service_name}-development" {{
+  context = "{build_context}"
+  tags = ["{service_name}:development"]
+  cache-from = ["type=registry,ref={service_name}:buildcache"]
+  cache-to = ["type=inline"]
+  target = "development"
+}}
+
+target "{service_name}-production" {{
+  context = "{build_context}"
+  tags = ["{service_name}:${{TAG}}"]
+  cache-from = ["type=registry,ref={service_name}:buildcache"]
+  platforms = ["linux/amd64", "linux/arm64"]
+  target = "production"
+}}
+"""
+    
+    # Write to file
+    bake_path = project_root / "docker-bake.hcl"
+    with open(bake_path, "w") as f:
+        f.write(bake_content)
+    
+    print(f"✔ Created bake file: {bake_path}")
+    return
+
+
 # ----------------------------------------------------------------------------
 # Entry‑point
 # ----------------------------------------------------------------------------
@@ -943,6 +1227,11 @@ def main() -> None:
     parser.add_argument("--force-type", "-t", choices=list(TEMPLATES.keys()), help="Force project type detection")
     parser.add_argument("--env-file", "-e", help="Specify path to an environment file to use for configuration")
     parser.add_argument("--list-supported", "-l", action="store_true", help="List all supported project types")
+    parser.add_argument("--no-gpu", action="store_true", help="Disable GPU detection and configuration")
+    parser.add_argument("--no-bake", action="store_true", help="Disable docker-bake.hcl generation")
+    parser.add_argument("--no-watch", action="store_true", help="Disable Docker Compose watch mode configuration")
+    parser.add_argument("--platform", choices=["auto", "amd64", "arm64"], default="auto", help="Force a specific platform target")
+    parser.add_argument("--resource-limits", action="store_true", help="Add resource limits to services")
     args = parser.parse_args()
     
     if args.list_supported:
@@ -981,7 +1270,18 @@ def main() -> None:
         if args.force_type:
             extra_techs.append(args.force_type)
         
-        compose_dict = generate_compose(project_path, extra=extra_techs)
+        # Set platform override if specified
+        if args.platform != "auto":
+            os.environ["DOCKER_DEFAULT_PLATFORM"] = f"linux/{args.platform}"
+        
+        compose_dict = generate_compose(
+            project_path, 
+            extra=extra_techs,
+            generate_bake=not args.no_bake,
+            enable_gpu=not args.no_gpu,
+            add_watch_mode=not args.no_watch
+        )
+        
         output_path = Path(args.output).resolve()
         write_compose(compose_dict, output_path)
         
@@ -990,9 +1290,34 @@ def main() -> None:
         if techs:
             print(f"✔ Detected technologies: {', '.join(techs)}")
         
+        # Print detected platform
+        platform_info = detect_platform()
+        print(f"✔ Target platform: {platform_info['docker_platform']}")
+        
+        # Print GPU capabilities if enabled
+        if not args.no_gpu:
+            gpu_capabilities = detect_gpu_capabilities()
+            if gpu_capabilities.get("has_gpu", False):
+                gpu_types = []
+                if gpu_capabilities.get("cuda", False):
+                    gpu_types.append("CUDA")
+                if gpu_capabilities.get("rocm", False):
+                    gpu_types.append("ROCm")
+                if gpu_capabilities.get("opencl", False):
+                    gpu_types.append("OpenCL")
+                if gpu_capabilities.get("intel_gpu", False):
+                    gpu_types.append("Intel GPU")
+                
+                print(f"✔ GPU capabilities detected: {', '.join(gpu_types)}")
+                print(f"  GPU passthrough enabled for compatible services")
+        
         print(f"✔ Next steps:")
         print(f"  1. Review {output_path}")
         print(f"  2. Run with: docker compose -f {output_path.name} up")
+        
+        # Show bake command if generated
+        if not args.no_bake:
+            print(f"  3. Or build with: docker buildx bake")
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
