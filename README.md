@@ -2,7 +2,7 @@
 
 ![Docker Compose](https://img.shields.io/badge/Docker_Compose-2.23.3-blue)
 ![Python](https://img.shields.io/badge/Python-3.10+-green)
-![License](https://img.shields.io/badge/License-MIT-orange)
+![License](https://img.shields.io/badge/License-MIT-purple)
 
 A lightweight desktop-friendly CLI/GUI hybrid tool that intelligently detects the technology stack of a local project and produces a ready-to-use `docker-compose.yml` optimized for development.
 
